@@ -1,0 +1,258 @@
+/**
+ * pi RPC 客户端。
+ *
+ * 拉起 `pi --mode rpc` 子进程，用 JSONL 与之对话：
+ *   - 带 id 的命令会收到 { type: "response", id, ... }
+ *   - 其余行是流式事件（agent_start / message_update / agent_end / ...）
+ *
+ * 只依赖 node 内置模块，插件安装后无需任何 npm install。
+ */
+import { spawn } from "node:child_process";
+import { attachLineReader, serializeLine } from "./jsonl.mjs";
+
+/** 单条命令等待响应的上限。prompt 只是「收下了」，真正的等待由 waitForIdle 负责。 */
+const COMMAND_TIMEOUT_MS = 30_000;
+/** 启动握手上限：靠一次 get_state 探活，比固定 sleep 更可靠。 */
+const HANDSHAKE_TIMEOUT_MS = 30_000;
+
+export class PiRpcClient {
+  /**
+   * @param {{
+   *   cliPath?: string, cwd?: string, env?: Record<string,string>,
+   *   provider?: string, model?: string, session?: boolean, extensions?: boolean,
+   *   prefixArgs?: string[], extraArgs?: string[]
+   * }} options
+   *
+   * prefixArgs 排在 `--mode rpc` 之前，测试用它把 cliPath 指向 node、再传入桩脚本路径。
+   */
+  constructor(options = {}) {
+    this.options = options;
+    this.process = null;
+    this.detachStdout = null;
+    this.listeners = new Set();
+    this.pending = new Map();
+    this.seq = 0;
+    this.stderr = "";
+    this.exited = null; // { code, signal }
+    /** start() 的握手顺带拿回的会话状态，省掉调用方再问一次。 */
+    this.initialState = null;
+  }
+
+  // ---------------------------------------------------------------- 生命周期
+
+  async start() {
+    if (this.process) throw new Error("客户端已启动");
+
+    const args = [...(this.options.prefixArgs ?? []), "--mode", "rpc"];
+    if (this.options.provider) args.push("--provider", this.options.provider);
+    if (this.options.model) args.push("--model", this.options.model);
+    // 一次性问答不落 session，免得污染 `pi -r` 的会话列表；常驻 agent 则保留。
+    if (this.options.session === false) args.push("--no-session");
+    // 加载扩展占了 pi 冷启动的大头（实测 1.2s → 0.4s）。一次性问答用不上它们，
+    // 常驻 agent 要真干活则照常加载。
+    if (this.options.extensions === false) args.push("--no-extensions");
+    if (this.options.extraArgs?.length) args.push(...this.options.extraArgs);
+
+    const cli = this.options.cliPath ?? "pi";
+    // Windows 的 npm 全局 bin 是 .cmd 垫片：CVE-2024-27980 之后 Node 直接 spawn 它会
+    // ENOENT/EINVAL，必须经 cmd.exe。用 shell:true 会导致 args 不再逐个转义（DEP0190，
+    // 带空格的路径会被拆散）；改成把 cmd.exe 本身当成目标程序、参数原样透传，Node 对
+    // 非 shell 模式的参数仍会做标准 Windows 转义，两头都对。
+    const [command, spawnArgs] =
+      process.platform === "win32" ? ["cmd.exe", ["/d", "/s", "/c", cli, ...args]] : [cli, args];
+
+    this.process = spawn(command, spawnArgs, {
+      cwd: this.options.cwd,
+      env: { ...process.env, ...this.options.env },
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+
+    this.process.on("error", (err) => this.#fail(new Error(`无法启动 pi：${err.message}`)));
+    this.process.stderr.setEncoding("utf8");
+    this.process.stderr.on("data", (text) => {
+      // 只留尾部，避免长跑 agent 把内存吃光。
+      this.stderr = (this.stderr + text).slice(-8192);
+    });
+
+    this.detachStdout = attachLineReader(this.process.stdout, (line) => this.#handleLine(line));
+
+    this.process.on("exit", (code, signal) => {
+      this.exited = { code, signal };
+      this.#fail(new Error(`pi 进程已退出（code=${code} signal=${signal}）${this.#stderrTail()}`));
+    });
+
+    // 握手：等 pi 真正开始应答，再放行后续命令。顺手把状态留下，调用方就不必再问一次。
+    const handshake = await this.send({ type: "get_state" }, HANDSHAKE_TIMEOUT_MS);
+    this.initialState = handshake?.success === false ? null : (handshake?.data ?? null);
+  }
+
+  async stop() {
+    const proc = this.process;
+    if (!proc) return;
+
+    this.detachStdout?.();
+    this.detachStdout = null;
+    this.process = null;
+
+    if (proc.exitCode !== null) return;
+
+    await new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        proc.kill("SIGKILL");
+        resolve();
+      }, 2000);
+      proc.once("exit", () => {
+        clearTimeout(timer);
+        resolve();
+      });
+      proc.kill("SIGTERM");
+    });
+
+    this.pending.clear();
+  }
+
+  // ---------------------------------------------------------------- 事件订阅
+
+  /** 订阅事件，返回退订函数。 */
+  onEvent(listener) {
+    this.listeners.add(listener);
+    return () => this.listeners.delete(listener);
+  }
+
+  getStderr() {
+    return this.stderr;
+  }
+
+  // ---------------------------------------------------------------- 命令封装
+
+  async prompt(message) {
+    await this.send({ type: "prompt", message });
+  }
+
+  async steer(message) {
+    await this.send({ type: "steer", message });
+  }
+
+  async abort() {
+    await this.send({ type: "abort" });
+  }
+
+  async getState() {
+    return this.#data(await this.send({ type: "get_state" }));
+  }
+
+  async setThinkingLevel(level) {
+    await this.send({ type: "set_thinking_level", level });
+  }
+
+  async bash(command) {
+    return this.#data(await this.send({ type: "bash", command }));
+  }
+
+  async getLastAssistantText() {
+    const data = this.#data(await this.send({ type: "get_last_assistant_text" }));
+    return data?.text ?? null;
+  }
+
+  async getSessionStats() {
+    return this.#data(await this.send({ type: "get_session_stats" }));
+  }
+
+  /** 等待本轮跑完（agent_end）。pi 之后还会发 agent_settled，不必等它。 */
+  waitForIdle(timeoutMs = 180_000) {
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        off();
+        reject(new Error(`等待 pi 完成超时（${timeoutMs}ms）${this.#stderrTail()}`));
+      }, timeoutMs);
+
+      const off = this.onEvent((event) => {
+        if (event.type !== "agent_end") return;
+        clearTimeout(timer);
+        off();
+        resolve();
+      });
+    });
+  }
+
+  /** 发一句话并等到跑完，返回最后一条助手文本。 */
+  async ask(message, timeoutMs) {
+    const idle = this.waitForIdle(timeoutMs);
+    await this.prompt(message);
+    await idle;
+    return (await this.getLastAssistantText()) ?? "";
+  }
+
+  // ---------------------------------------------------------------- 内部实现
+
+  send(command, timeoutMs = COMMAND_TIMEOUT_MS) {
+    const stdin = this.process?.stdin;
+    if (!stdin) return Promise.reject(new Error("客户端未启动或已停止"));
+
+    const id = `req_${++this.seq}`;
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.pending.delete(id);
+        reject(new Error(`等待 ${command.type} 响应超时${this.#stderrTail()}`));
+      }, timeoutMs);
+
+      this.pending.set(id, {
+        resolve: (value) => {
+          clearTimeout(timer);
+          resolve(value);
+        },
+        reject: (err) => {
+          clearTimeout(timer);
+          reject(err);
+        },
+      });
+
+      stdin.write(serializeLine({ ...command, id }), (err) => {
+        if (!err) return;
+        this.pending.delete(id);
+        clearTimeout(timer);
+        reject(new Error(`写入 pi stdin 失败：${err.message}`));
+      });
+    });
+  }
+
+  #handleLine(line) {
+    let payload;
+    try {
+      payload = JSON.parse(line);
+    } catch {
+      return; // 非 JSON 的噪声行直接丢弃
+    }
+
+    if (payload?.type === "response" && payload.id && this.pending.has(payload.id)) {
+      const waiter = this.pending.get(payload.id);
+      this.pending.delete(payload.id);
+      waiter.resolve(payload);
+      return;
+    }
+
+    for (const listener of [...this.listeners]) {
+      try {
+        listener(payload);
+      } catch {
+        // 监听器自身出错不该拖垮读取循环
+      }
+    }
+  }
+
+  /** 进程挂掉时，把所有在途请求一次性打回。 */
+  #fail(error) {
+    for (const waiter of this.pending.values()) waiter.reject(error);
+    this.pending.clear();
+  }
+
+  #data(response) {
+    if (response?.success === false) throw new Error(response.error ?? "pi 返回未知错误");
+    return response?.data;
+  }
+
+  #stderrTail() {
+    const tail = this.stderr.trim();
+    return tail ? `\npi stderr: ${tail.slice(-1000)}` : "";
+  }
+}

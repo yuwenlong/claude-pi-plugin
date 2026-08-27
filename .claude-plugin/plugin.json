@@ -1,0 +1,23 @@
+{
+  "name": "claude-pi",
+  "description": "在 Claude Code 里用斜杠命令直接驱动 Pi 编程智能体：一次性提问、拉起常驻 agent 并行干活、中途插话纠偏。零依赖，装完即用。",
+  "version": "0.2.0",
+  "author": {
+    "name": "yuwenlong",
+    "url": "https://github.com/yuwenlong"
+  },
+  "commands": [
+    "./commands/ask.md",
+    "./commands/spawn.md",
+    "./commands/send.md",
+    "./commands/steer.md",
+    "./commands/list.md",
+    "./commands/bash.md",
+    "./commands/stop.md",
+    "./commands/doctor.md"
+  ],
+  "homepage": "https://github.com/yuwenlong/claude-pi-plugin",
+  "repository": "https://github.com/yuwenlong/claude-pi-plugin",
+  "license": "MIT",
+  "keywords": ["pi", "agent", "subagent", "orchestration", "coding-agent", "claude-code"]
+}
