@@ -6,7 +6,7 @@
   },
   "metadata": {
     "description": "用斜杠命令在 Claude Code 里驱动 Pi 编程智能体",
-    "version": "0.2.0"
+    "version": "0.2.1"
   },
   "plugins": [
     {

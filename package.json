@@ -1,6 +1,6 @@
 {
   "name": "claude-pi-plugin",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "private": true,
   "description": "Claude Code 插件：用斜杠命令驱动 Pi 编程智能体（运行时零依赖）",
   "type": "module",
