@@ -42,3 +42,27 @@
 
 - 涉及外部宿主（插件系统、CI、包管理器）的产物，**装一遍、调一次**才算完成，读文档和读源码都不能替代。
 - 实跑一旦暴露命名/接口事实，要**回头改设计**，而不是在文档里给错误命名打补丁。
+
+## 2026-08-31 · Windows 上「无 console 的父进程」会给子进程新开一个可见黑窗
+
+**圣上的报告原话**：「让你指挥 pi 干活时，为什么现在会呼起个命令行黑色窗口了？是因为 pi 升级到 0.84 的原因吗？」
+
+**真实根因**（与 pi 版本无关）：守护进程由 `ipc.mjs` 以 `detached: true` 拉起，Windows 给它
+`DETACHED_PROCESS`——它**自己没有 console**。随后 `rpc-client.mjs` 在它里面 spawn
+`cmd.exe /d /s /c pi --mode rpc ...`，而 cmd.exe 是控制台子系统程序：父进程没有 console 可继承、
+调用方又没给 `CREATE_NO_WINDOW`，Windows 就**新分配一个可见 console 窗口**（Win11 下由
+Windows Terminal 承载），且 agent 活多久它就杵多久。修法是给那次 spawn 加 `windowsHide: true`。
+
+**为什么以前没察觉**：一次性 `ask` 直连 pi，跑在 Claude Code 自己的终端里、有 console 可继承，
+从不弹窗。只有走守护进程的常驻 agent（spawn/send）才会触发。改用常驻 agent 之后才暴露。
+
+**给自己立的规矩**：
+
+- Windows 上 spawn 任何控制台程序（尤其 `cmd.exe`、`.cmd` 垫片），一律显式写 `windowsHide: true`。
+  Node 该项默认是 `false`，`stdio: "pipe"` **不能**代替它。
+- `detached: true` 只解决"子进程活过父进程"，它同时切断了 console 继承，反而让**孙进程**开始弹窗。
+  两个 spawn 分别在两个文件里时，这条因果链很容易漏看——要顺着**整条进程树**看，别只看单点。
+- 排查 GUI 现象要拿**实证**而非推理：`conhost.exe` 存在**不等于**窗口可见（`CREATE_NO_WINDOW`
+  照样起 conhost）。真正的判据是枚举顶层窗口 + `IsWindowVisible`，再把窗口 pid 反查到父进程。
+- 圣上给的归因（"是不是 pi 升级导致的"）是**线索不是结论**。本例中插件只有一个提交、从未改过，
+  而黑窗随 agent 起停同生同灭——先做能证伪的实验，再下判断。

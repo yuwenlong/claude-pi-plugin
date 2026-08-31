@@ -65,6 +65,10 @@ export class PiRpcClient {
       cwd: this.options.cwd,
       env: { ...process.env, ...this.options.env },
       stdio: ["pipe", "pipe", "pipe"],
+      // 守护进程是 detached 起来的、自身没有 console，Windows 便会给 cmd.exe 这个
+      // 控制台程序新开一个可见窗口（Win11 下由 Windows Terminal 承载），且 agent
+      // 活多久它就杵多久。CREATE_NO_WINDOW 把它按住，stdio 仍走管道，不受影响。
+      windowsHide: true,
     });
 
     this.process.on("error", (err) => this.#fail(new Error(`无法启动 pi：${err.message}`)));
