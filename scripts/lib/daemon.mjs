@@ -70,7 +70,7 @@ export function setClientFactory(factory) {
   createClient = factory;
 }
 
-async function spawnAgent({ id, cwd, provider, model, thinkingLevel, initialPrompt, extensions }) {
+async function spawnAgent({ id, cwd, provider, model, thinkingLevel, initialPrompt, extensions, timeoutMs }) {
   if (agents.has(id)) throw new Error(`agent "${id}" 已存在`);
   if (agents.size >= config.limits.maxConcurrentAgents) {
     throw new Error(`并发 agent 数已达上限（${config.limits.maxConcurrentAgents}）`);
@@ -137,7 +137,9 @@ async function spawnAgent({ id, cwd, provider, model, thinkingLevel, initialProm
   let initialError;
   if (initialPrompt) {
     try {
-      reply = await enqueue(agent.queue, () => client.ask(initialPrompt, config.limits.defaultTimeoutMs));
+      reply = await enqueue(agent.queue, () =>
+        client.ask(initialPrompt, timeoutMs ?? config.limits.defaultTimeoutMs),
+      );
     } catch (err) {
       // agent 本身已经起来了，首轮任务失败不该连它一起判死：报就绪并带上错误，
       // 免得调用方以为没起来、换个名字重开，白白扔掉一个能用的 agent。
@@ -224,6 +226,18 @@ export async function handle(payload) {
   return handlers[cmd](payload.args ?? {});
 }
 
+/**
+ * 一行 JSON 请求 → 一行响应。错误除了 message（给人看）还透传 code（给程序分派）：
+ * PI_TIMEOUT 这类码到了 CLI 那侧按「还在跑」收场，而不是当失败报错。
+ */
+export async function dispatch(line) {
+  try {
+    return { ok: true, data: await handle(JSON.parse(line)) };
+  } catch (err) {
+    return { ok: false, error: err?.message ?? String(err), code: err?.code };
+  }
+}
+
 // ------------------------------------------------------------------ 服务器
 
 const server = net.createServer((socket) => {
@@ -241,8 +255,9 @@ const server = net.createServer((socket) => {
 
     let response;
     try {
-      response = { ok: true, data: await handle(JSON.parse(line)) };
+      response = await dispatch(line);
     } catch (err) {
+      // dispatch 自身不该再抛；真到了这里，说明连错误组装都出了意外。
       response = { ok: false, error: err?.message ?? String(err) };
     }
     resetIdleTimer();

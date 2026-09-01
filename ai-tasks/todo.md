@@ -252,3 +252,91 @@ GitHub 装的 0.2.1，圣上日常在用；为了不影响圣上正在依赖的�
   「两个 daemon 抢 socket 文件」这个原始故障场景只能靠代码推理，验到的是让位逻辑本身。
 - 同样因为 Git Bash 损坏，**slash 命令这一层整体没法实跑**（`commands/*.md` 里的 `!` 那行由 bash 执行）。
   本次全部验证都走 `node scripts/pi-agent.mjs <cmd>`，也就是 slash 命令包着的那条命令本身。
+
+---
+
+## 0.5.0：修复 slash 命令超时被宿主硬杀（2026-09-01）
+
+基线：`npm test` 67 条全绿（2026-09-24 实测）。`defaultTimeoutMs` 保持 180000 不动（分层设计）。
+不碰 git add / commit / push / tag。
+
+## 改动清单
+
+- [x] 一、四个 slash 命令加 `--timeout 100000`（子命令名后）：commands/send.md、ask.md、bash.md、spawn.md
+- [x] 二、超时改成功态
+  - [x] rpc-client.mjs：`waitForIdle` 超时 Error 打 `code = "PI_TIMEOUT"`
+  - [x] rpc-client.mjs：`bash()` 的"等待 bash 响应超时"同样打 `PI_TIMEOUT`（bash 不走 waitForIdle，不打码则 cmdBash 捕获永不命中——目标要求 bash 超时也 exit 0，此为唯一通路）
+  - [x] daemon.mjs：错误响应组装提取为 `dispatch(line)`，带 `code: err?.code`（同时让它可测）
+  - [x] pi-agent.mjs：`callDaemon` 抛错时挂 `response.code`
+  - [x] pi-agent.mjs：`cmdSend`/`cmdBash` catch `PI_TIMEOUT` → 输出两行 ⏳ 提示后正常 return（提取 `reportTimeout` helper，两处共用）
+  - [x] pi-agent.mjs：`cmdAsk` catch `PI_TIMEOUT` → 仍 `fail`（exit 1），文案说明问答已作废、长任务改用 spawn+send；注意先走 finally 的 `client.stop()` 再 fail，不能留孤儿 pi 进程
+- [x] 三、spawn 的 `--timeout` 打通
+  - [x] pi-agent.mjs `cmdSpawn`：解析 `options.timeout`，`timeoutMs` 进 spawn 参数对象并作为 callDaemon 第三参
+  - [x] daemon.mjs `spawnAgent`：接收 `timeoutMs`，首轮 `client.ask` 用它，缺省回退 `config.limits.defaultTimeoutMs`；initialError 容错不动
+- [x] 四、新增 commands/send-bg.md（`send --no-wait --stdin`，非阻塞语义说明）；plugin.json commands 数组紧跟 send.md 后登记
+- [x] 五、版本号 0.4.0 → 0.5.0：package.json、plugin.json、marketplace.json metadata.version
+- [x] 六、README.md（首轮只改了防卡死一段，另三处遗漏经丞相点出后补齐）：命令表加 send-bg 行；bash 行超时说明、troubleshooting"命令卡住不返回"行、防卡死段三处改新语义（slash 100s 返回"还在跑" / CLI 180s / 长任务用 send-bg）
+- [x] 七、补测试（node:test，fake-pi 桩）
+  - [x] rpc-client.test.mjs：waitForIdle 超时 err.code === "PI_TIMEOUT"（顺带 bash 超时带码一条）
+  - [x] daemon.test.mjs：错误响应透传 code（走 dispatch 全链路）
+  - [x] daemon.test.mjs：spawn 传极短 timeoutMs，首轮按该值超时拿 initialError（FakeClient.ask 需支持 timeoutMs 模拟超时）；不传时回退 defaultTimeoutMs
+  - [x] no-wait queued:true —— 现有"agent 还忙着时再 send"用例已断言，跳过
+
+## 收工自检
+
+- [x] `npm test` 全绿：**73 passed / 0 failed**（改前 67，净增 6 条）
+- [x] `scripts/lib/config.mjs` 的 `defaultTimeoutMs` 仍是 180000（已核）
+- [x] 未执行任何 git 写操作（已核）
+
+## 评审
+
+### 根因
+
+两次「超时」是两种机制，此前一直被混为一谈：
+
+| | 表现 | 谁喊停 |
+|---|---|---|
+| 插件自己的超时 | `✗ 等待 pi 完成超时（180000ms）`，exit 1 | pi-agent 等满 `defaultTimeoutMs` |
+| 宿主的硬超时 | `Command timed out after 2m 0s`，进程被杀 | Claude Code 在 **120 秒**砍掉 slash 命令 |
+
+`defaultTimeoutMs: 180_000` > 宿主 120 秒上限，所以走 slash 路径时**插件自己的超时逻辑永远轮不到执行**，
+每次都先被 SIGKILL，连「仍在跑」的提示都吐不出来。且语义本就是错的——超时时 agent 还在干活、上下文完好，
+不该算失败。
+
+### 设计取舍
+
+**分层，而不是把默认值降下来**：`config.mjs` 的 `defaultTimeoutMs` 保持 180000 不动（CLI 直调不受宿主约束，
+180 秒是合理默认），只在四个 slash 命令的调用行写死 `--timeout 100000`。约束来自宿主且只作用于 slash 路径，
+修正就该打在那一层，不该为迁就单一宿主而降低库本身的默认值。
+
+### Pi 补上的三处（原计划没想到）
+
+1. **`bash()` 的超时不走 `waitForIdle`** —— 它在 `send({type:"bash"})` 那条路上 reject，原计划只给 `waitForIdle`
+   打 `PI_TIMEOUT` 码，`cmdBash` 的捕获分支会成为死代码。此为该功能的唯一通路。
+2. **`daemon.mjs` 把错误组装提取为 `dispatch(line)`** —— 既透传 code，又让这条链可被测试直接驱动。
+3. **`cmdAsk` 用 `askTimedOut` 标志先走完 `finally` 的 `client.stop()` 再 `fail`** —— 否则留下孤儿 pi 进程。
+
+### 验证证据
+
+1. **单测**：`npm test` → **73 passed / 0 failed**（改前 67，净增 6 条）。
+2. **反向验证**（绿色本身不算证据）：逐条撤掉修复重跑，每撤一条**恰好一条**测试变红，还原后全绿——
+   撤 `waitForIdle` 打码 → fail=1；撤 `bash()` 打码 → fail=1；撤 `dispatch` 透传 code → fail=1；
+   撤 `spawnAgent` 的 `timeoutMs` → fail=1。
+3. **端到端**（停掉旧 daemon，用本仓库新代码起真实链路）：
+
+   | 命令 | 结果 | 改前 |
+   |---|---|---|
+   | `spawn --timeout 3000` | 4 秒返回，**exit 0**，agent 保留 | 等满 180 秒 |
+   | `send --timeout 3000` | 3 秒返回「⏳ 还在跑」，**exit 0** | exit 1 报错 |
+   | `send --no-wait` | **0 秒**投递即返 | slash 传不进该选项 |
+   | `ask --timeout 3000` | 3 秒返回 **exit 1** 并指路 spawn+send | 文案未指路 |
+
+4. `claude plugin validate .` 通过。
+
+### 没能验到的地方（如实说明）
+
+- **slash 路径本身未实测**。`commands/*.md` 里那行 `!` 命令由 Claude Code 宿主执行，而宿主加载的是
+  `~/.claude/plugins/cache/` 下的已安装版本，不是本仓库源码。本次全部验证走的是 `node scripts/pi-agent.mjs`，
+  也就是 slash 命令包着的那条命令本身。**「100 秒到点返回而非被宿主砍死」这一条，须待插件重装到 0.5.0 后由圣上实测确认。**
+- `STATE_DIR` 写死在 `~/.claude-pi-plugin`，无法用环境变量隔离出独立 socket，所以端到端验证是靠停掉旧
+  daemon 腾位置做的，代价是把当时在岗的两个 agent 一并收了。

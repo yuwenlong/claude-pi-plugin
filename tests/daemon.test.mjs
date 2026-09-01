@@ -1,6 +1,6 @@
 import { test, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
-import { handlers, handle, setClientFactory } from "../scripts/lib/daemon.mjs";
+import { handlers, handle, dispatch, setClientFactory } from "../scripts/lib/daemon.mjs";
 import { loadConfig } from "../scripts/lib/config.mjs";
 
 /**
@@ -18,15 +18,18 @@ class FakeClient {
     this.turnMs = 30;
     this.failNextAsk = null;
     this.lastBashTimeout = null;
+    this.lastAskTimeout = null;
     this.lastText = null;
     this.pendingTurns = [];
     this.busy = false;
+    this.turnTimer = null;
   }
 
   async start() {}
 
   async stop() {
     this.stopped = true;
+    clearTimeout(this.turnTimer);
   }
 
   onEvent(listener) {
@@ -52,21 +55,39 @@ class FakeClient {
     return { output: `ran: ${command}`, exitCode: 0, truncated: false };
   }
 
-  async ask(message) {
+  async ask(message, timeoutMs) {
     if (this.failNextAsk) {
       const err = this.failNextAsk;
       this.failNextAsk = null;
       throw err;
     }
-    const idle = new Promise((resolve) => {
+    this.lastAskTimeout = timeoutMs;
+    // 与真实客户端一致：agent_end 迟迟不来就按 timeoutMs 超时，错误带 PI_TIMEOUT。
+    let timer;
+    const idle = new Promise((resolve, reject) => {
       const off = this.onEvent((e) => {
         if (e.type !== "agent_end") return;
         off();
         resolve();
       });
+      if (timeoutMs !== undefined) {
+        timer = setTimeout(() => {
+          off();
+          const err = new Error(`等待 pi 完成超时（${timeoutMs}ms）`);
+          err.code = "PI_TIMEOUT";
+          reject(err);
+        }, timeoutMs);
+        // stop() 会清掉 turnTimer、agent_end 再不会来，只剩这条超时 timer 兜底；
+        // unref 让它别拖着测试进程不退（真实客户端靠进程退出事件打回等待者，不存在此问题）。
+        timer.unref?.();
+      }
     });
     this.#queueTurn(message);
-    await idle;
+    try {
+      await idle;
+    } finally {
+      clearTimeout(timer);
+    }
     return this.lastText;
   }
 
@@ -84,7 +105,7 @@ class FakeClient {
     }
     this.busy = true;
     this.#emit({ type: "agent_start" });
-    setTimeout(() => {
+    this.turnTimer = setTimeout(() => {
       this.lastText = `回复：${message}`;
       this.#emit({ type: "agent_end" });
       this.#runNext();
@@ -181,6 +202,47 @@ test("首轮任务失败时 agent 仍在，只是带回 initialError", async () 
   );
   // 而且它接着就能干活。
   assert.equal((await handlers.send({ id: "a1", message: "再来" })).reply, "回复：再来");
+});
+
+test("spawn 传了 timeoutMs 时，首轮按它超时并带回 initialError，而不是挂满默认 180 秒", async () => {
+  setClientFactory((options) => {
+    lastClient = new FakeClient(options);
+    lastClient.turnMs = 60_000; // 首轮怎么都跑不完
+    return lastClient;
+  });
+
+  const startedAt = Date.now();
+  const result = await handlers.spawn({ id: "a1", cwd: ".", initialPrompt: "慢活", timeoutMs: 50 });
+
+  assert.ok(Date.now() - startedAt < 5000, "首轮该在 50ms 超时，而不是等满默认 180 秒");
+  assert.equal(lastClient.lastAskTimeout, 50);
+  assert.match(result.initialError, /等待 pi 完成超时（50ms）/);
+  assert.equal(result.reply, undefined);
+  // 首轮超时不该连 agent 一起判死
+  assert.deepEqual(
+    handlers.list().agents.map((a) => a.id),
+    ["a1"],
+  );
+});
+
+test("spawn 不传 timeoutMs 时，首轮回退到 defaultTimeoutMs", async () => {
+  await handlers.spawn({ id: "a1", cwd: ".", initialPrompt: "干活" });
+  assert.equal(lastClient.lastAskTimeout, loadConfig().limits.defaultTimeoutMs);
+});
+
+test("错误响应透传 code 字段，CLI 据此把 PI_TIMEOUT 按「还在跑」收场", async () => {
+  await handlers.spawn({ id: "a1", cwd: "." });
+  lastClient.failNextAsk = Object.assign(new Error("等待 pi 完成超时（100000ms）"), { code: "PI_TIMEOUT" });
+
+  const response = await dispatch(JSON.stringify({ cmd: "send", args: { id: "a1", message: "x" } }));
+  assert.equal(response.ok, false);
+  assert.equal(response.code, "PI_TIMEOUT");
+  assert.match(response.error, /等待 pi 完成超时/);
+
+  // 普通错误没有 code，字段是 undefined（JSON 序列化时会丢弃，旧调用方无感）
+  const plain = await dispatch(JSON.stringify({ cmd: "send", args: { id: "ghost", message: "x" } }));
+  assert.equal(plain.ok, false);
+  assert.equal(plain.code, undefined);
 });
 
 test("stop --all 一次收掉所有 agent", async () => {

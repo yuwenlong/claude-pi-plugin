@@ -62,10 +62,11 @@ Claude Code 擅长统筹，Pi 是另一个快而能干的编程智能体。这�
 | `/claude-pi:ask <问题>` | 一次性提问，问完就退。最常用 |
 | `/claude-pi:spawn <名字> [初始任务]` | 拉起一个常驻 agent |
 | `/claude-pi:send <名字> <消息>` | 给常驻 agent 发消息并等结果 |
+| `/claude-pi:send-bg <名字> <消息>` | 派活但不等结果，适合长任务；用 list 看进度、事后再 send 要结果 |
 | `/claude-pi:steer <名字> <指令>` | 在它干活途中插话纠偏 |
 | `/claude-pi:abort <名字>` | 打断某个 agent 当前这一轮 |
 | `/claude-pi:list` | 列出所有常驻 agent 及状态 |
-| `/claude-pi:bash <名字> <命令>` | 借它的 shell 执行命令（等待上限同 `limits.defaultTimeoutMs`，默认 180 秒） |
+| `/claude-pi:bash <名字> <命令>` | 借它的 shell 执行命令（slash 内嵌 100 秒，到点返回“还在跑”的提示而非报错；CLI 直调默认 180 秒，同 `limits.defaultTimeoutMs`） |
 | `/claude-pi:stop <名字>` | 停掉某个 agent（`--all` 全停） |
 | `/claude-pi:doctor` | 环境自检 |
 
@@ -126,7 +127,7 @@ Claude Code 擅长统筹，Pi 是另一个快而能干的编程智能体。这�
 ```
 
 `extensionDialogTimeoutMs` 见下方"扩展弹窗会不会卡死常驻 agent"一节。
-`defaultTimeoutMs` 同时也是 `/claude-pi:bash` 的等待上限——编译、跑测试都归它管。
+`defaultTimeoutMs` 是 CLI 直调时 `send`/`bash`/`spawn` 首轮的默认等待上限——编译、跑测试都归它管；slash 命令不走这个值，它们内嵌了 100 秒，到点返回“还在跑”的提示而非报错。
 
 改完配置得让守护进程重新读：它在启动时快照一次 `config.json`，之后不再重读。
 `stop --all` 只收 agent、不关守护进程，等它闲置退场（默认 30 分钟）即可，
@@ -177,7 +178,7 @@ node scripts/pi-agent.mjs ask --provider anthropic --model claude-sonnet-4 -- "�
 | 症状 | 处理 |
 |------|------|
 | 提示找不到 pi CLI | `npm install -g @earendil-works/pi-coding-agent` |
-| 命令卡住不返回 | 先 `/claude-pi:list` 看 agent 是不是还在忙；要加大等待上限得走 CLI 直调的 `--timeout` |
+| 命令卡住不返回 | slash 命令内嵌 100 秒上限，到点会返回“还在跑”的提示而非卡死——那不是失败，agent 上下文完好，跑完后 `/claude-pi:send <名字>` 要结果；长任务改用 `/claude-pi:send-bg` 派完即走。要加大等待上限仍得走 CLI 直调的 `--timeout` |
 | 常驻 agent 一直显示 `busy` 不动 | 先 `/claude-pi:abort <名字>` 打断当前这一轮；若还是不动，看下面"扩展弹窗会不会卡死常驻 agent" |
 | 守护进程连不上 | 看日志 `~/.claude-pi-plugin/daemon.log` |
 | 想彻底重置 | `/claude-pi:stop --all`，必要时删掉 `~/.claude-pi-plugin/daemon.sock` |
@@ -192,8 +193,10 @@ pi 的内置工具（read/bash/edit/write）在 `--mode rpc` 下不会弹确认�
 
 插件对此有兜底：客户端收到这类弹窗请求后起一个计时器（默认 30 秒，`limits.extensionDialogTimeoutMs`
 可调），到点没人应答就自动回"取消"，让那一轮收场，而不是永久挂起。`/claude-pi:send`/`ask`
-本身也自带超时（默认 180 秒），所以即便真遇上这种情况，Claude 的主会话也不会被拖死；
+本身也自带超时（slash 命令内嵌 100 秒，到点返回「还在跑」的提示而不是报错；CLI 直调默认 180 秒），
+所以即便真遇上这种情况，Claude 的主会话也不会被拖死；
 真正会"卡住"的只是那个 pi agent 本身，会一直显示 `busy` 直到兜底超时触发或你手动 `abort`。
+跑长任务可以用 `/claude-pi:send-bg` 派完即走，不必守着等。
 
 不想承担这份风险的话，`spawn` 一个纯实施型 agent 时可以直接不加载扩展（见"开发"一节里的
 CLI 用法，`--no-extensions` 打在 slash 命令的参数文本里不生效）——从源头避免这类弹窗。

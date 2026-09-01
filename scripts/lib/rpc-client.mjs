@@ -181,7 +181,14 @@ export class PiRpcClient {
 
   /** 跑一条 shell 命令。编译、测试动辄几分钟，所以超时由调用方给，不套用命令级的 30s。 */
   async bash(command, timeoutMs) {
-    return this.#data(await this.send({ type: "bash", command }, timeoutMs));
+    try {
+      return this.#data(await this.send({ type: "bash", command }, timeoutMs));
+    } catch (err) {
+      // 与 waitForIdle 的超时同码：超时只代表「还没跑完」，不是失败，
+      // 守护进程把 code 透传给 CLI，由它按「还在跑」收场。
+      if (/^等待 bash 响应超时/.test(err.message)) err.code = "PI_TIMEOUT";
+      throw err;
+    }
   }
 
   async getLastAssistantText() {
@@ -203,10 +210,12 @@ export class PiRpcClient {
         fn(arg);
       };
 
-      const timer = setTimeout(
-        () => settle(reject, new Error(`等待 pi 完成超时（${timeoutMs}ms）${this.#stderrTail()}`)),
-        timeoutMs,
-      );
+      const timer = setTimeout(() => {
+        // 打上 code：守护进程把它透传给 CLI，send/bash 据此按「还在跑」而非失败收场。
+        const err = new Error(`等待 pi 完成超时（${timeoutMs}ms）${this.#stderrTail()}`);
+        err.code = "PI_TIMEOUT";
+        settle(reject, err);
+      }, timeoutMs);
 
       // 登记进来：pi 半路死了，agent_end 永远不会来，得由 #fail 立刻打回，
       // 而不是让调用方干等满整个超时、还拿到一句掩盖真实死因的「超时」。

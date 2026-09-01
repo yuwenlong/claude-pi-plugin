@@ -4,7 +4,7 @@ argument-hint: <agent名字> [初始任务]
 allowed-tools: Bash(node:*)
 ---
 
-!`node "${CLAUDE_PLUGIN_ROOT}/scripts/pi-agent.mjs" spawn --stdin <<'CLAUDE_PI_EOF'
+!`node "${CLAUDE_PLUGIN_ROOT}/scripts/pi-agent.mjs" spawn --timeout 100000 --stdin <<'CLAUDE_PI_EOF'
 $ARGUMENTS
 CLAUDE_PI_EOF`
 

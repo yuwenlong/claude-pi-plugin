@@ -4,7 +4,7 @@ argument-hint: <问题或任务>
 allowed-tools: Bash(node:*)
 ---
 
-!`node "${CLAUDE_PLUGIN_ROOT}/scripts/pi-agent.mjs" ask --stdin <<'CLAUDE_PI_EOF'
+!`node "${CLAUDE_PLUGIN_ROOT}/scripts/pi-agent.mjs" ask --timeout 100000 --stdin <<'CLAUDE_PI_EOF'
 $ARGUMENTS
 CLAUDE_PI_EOF`
 

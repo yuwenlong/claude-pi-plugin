@@ -60,8 +60,22 @@ function formatAgentRow(a) {
 
 async function callDaemon(cmd, args, timeoutMs) {
   const response = await request({ cmd, args }, timeoutMs ? { timeoutMs: timeoutMs + 30_000 } : {});
-  if (!response.ok) throw new Error(response.error);
+  if (!response.ok) {
+    // code 随错误一起抛：PI_TIMEOUT 到了子命令那里按「还在跑」收场，不当失败。
+    const err = new Error(response.error);
+    err.code = response.code;
+    throw err;
+  }
   return response.data;
+}
+
+/**
+ * send/bash 等待超时的统一收场：这不是失败——agent 还在跑、上下文完好，
+ * 把「怎么跟进」告诉用户后正常返回（exit 0），别让宿主把它当报错。
+ */
+function reportStillRunning(id, timeoutMs) {
+  out(`⏳ 已等待 ${timeoutMs / 1000} 秒，"${id}" 还在跑——这不是失败，agent 上下文完好。`);
+  out(`   用 /claude-pi:list 看进度；跑完后 /claude-pi:send ${id} 要结果，或 /claude-pi:abort ${id} 打断这一轮。`);
 }
 
 // ------------------------------------------------------------------ 子命令
@@ -89,6 +103,7 @@ async function cmdAsk(options, positional) {
     dialogTimeoutMs: config.limits.extensionDialogTimeoutMs,
   });
 
+  let askTimedOut = false;
   try {
     await client.start();
     if (resolved.thinkingLevel) {
@@ -101,8 +116,20 @@ async function cmdAsk(options, positional) {
 
     const model = state?.model ? `${state.model.provider}/${state.model.id}` : "pi 默认模型";
     out(`【pi · ${model}】\n${reply || "(pi 没有返回文本)"}`);
+  } catch (err) {
+    if (err?.code !== "PI_TIMEOUT") throw err;
+    // 一次性问答没有常驻 agent，超时后没法事后补要结果——仍按失败退出（exit 1），
+    // 但先把话说明白，并指路给能扛长任务的 spawn + send。
+    askTimedOut = true;
   } finally {
     await client.stop();
+  }
+
+  if (askTimedOut) {
+    fail(
+      `已等待 ${timeoutMs / 1000} 秒，pi 还没答完——这次问答已作废（一次性问答没有常驻 agent，事后无法补要结果）。\n` +
+        `  长任务请改用 /claude-pi:spawn 起常驻 agent，再用 /claude-pi:send 派活，超时了还能回头要结果。`,
+    );
   }
 }
 
@@ -110,15 +137,22 @@ async function cmdSpawn(options, positional) {
   const [id, ...rest] = positional;
   if (!id) fail("请给 agent 起个名字，例如：pi-agent spawn worker");
 
-  const data = await callDaemon("spawn", {
-    id,
-    cwd: options.cwd ?? process.cwd(),
-    provider: options.provider,
-    model: options.model,
-    thinkingLevel: options.thinking,
-    initialPrompt: joinText(rest) || undefined,
-    extensions: options["no-extensions"] ? false : undefined,
-  });
+  const config = loadConfig();
+  const timeoutMs = parseTimeout(options.timeout, config.limits.defaultTimeoutMs);
+  const data = await callDaemon(
+    "spawn",
+    {
+      id,
+      cwd: options.cwd ?? process.cwd(),
+      provider: options.provider,
+      model: options.model,
+      thinkingLevel: options.thinking,
+      initialPrompt: joinText(rest) || undefined,
+      extensions: options["no-extensions"] ? false : undefined,
+      timeoutMs,
+    },
+    timeoutMs,
+  );
 
   if (options.json) return out(JSON.stringify(data, null, 2));
   out(`✓ agent "${id}" 已就绪（${data.info.provider}/${data.info.model}，目录 ${data.info.cwd}）`);
@@ -136,7 +170,13 @@ async function cmdSend(options, positional) {
 
   const config = loadConfig();
   const timeoutMs = parseTimeout(options.timeout, config.limits.defaultTimeoutMs);
-  const data = await callDaemon("send", { id, message, wait: !options["no-wait"], timeoutMs }, timeoutMs);
+  let data;
+  try {
+    data = await callDaemon("send", { id, message, wait: !options["no-wait"], timeoutMs }, timeoutMs);
+  } catch (err) {
+    if (err?.code !== "PI_TIMEOUT") throw err;
+    return reportStillRunning(id, timeoutMs);
+  }
 
   if (options.json) return out(JSON.stringify(data, null, 2));
   if (data.queued) return out(`✓ 消息已投递给 "${id}"，用 /claude-pi:list 查看进度`);
@@ -194,7 +234,13 @@ async function cmdBash(options, positional) {
 
   // 编译、跑测试动辄几分钟，超时得跟 send 一个量级，不能是命令级的 30 秒。
   const timeoutMs = parseTimeout(options.timeout, loadConfig().limits.defaultTimeoutMs);
-  const { result } = await callDaemon("bash", { id, command, timeoutMs }, timeoutMs);
+  let result;
+  try {
+    ({ result } = await callDaemon("bash", { id, command, timeoutMs }, timeoutMs));
+  } catch (err) {
+    if (err?.code !== "PI_TIMEOUT") throw err;
+    return reportStillRunning(id, timeoutMs);
+  }
   if (options.json) return out(JSON.stringify(result, null, 2));
   out(`$ ${command}\n退出码: ${result.exitCode}${result.truncated ? "（输出已截断）" : ""}\n${result.output}`);
 }

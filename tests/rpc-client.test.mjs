@@ -104,6 +104,36 @@ test("waitForIdle 超时会报错并带上时长", async () => {
   });
 });
 
+test("waitForIdle 超时错误带 PI_TIMEOUT 代码，守护进程靠它透传、CLI 靠它按「还在跑」收场", async () => {
+  await withClient({}, async (client) => {
+    const err = await client.waitForIdle(50).then(() => null, (e) => e);
+    assert.equal(err.code, "PI_TIMEOUT");
+    assert.match(err.message, /等待 pi 完成超时（50ms）/);
+  });
+});
+
+test("bash 超时同样带 PI_TIMEOUT 代码：命令还没跑完不是失败", async () => {
+  await withClient({}, async (client) => {
+    const err = await client.bash("sleep:5000", 50).then(() => null, (e) => e);
+    assert.equal(err.code, "PI_TIMEOUT");
+    assert.match(err.message, /等待 bash 响应超时/);
+  });
+});
+
+test("bash 因 pi 半路死掉而失败的错误不带 PI_TIMEOUT 码，不会被误当「还在跑」", async () => {
+  const client = new PiRpcClient({ cliPath: process.execPath, prefixArgs: [FAKE_PI] });
+  await client.start();
+
+  const slow = client.bash("sleep:30000", 60_000);
+  client.send({ type: "crash" }).catch(() => {});
+
+  const err = await slow.then(() => null, (e) => e);
+  assert.match(err.message, /pi 进程已退出/);
+  assert.notEqual(err.code, "PI_TIMEOUT");
+
+  await client.stop();
+});
+
 test("pi 进程半路死掉时，等 agent_end 的人立刻被打回，不必干等满超时", async () => {
   const client = new PiRpcClient({ cliPath: process.execPath, prefixArgs: [FAKE_PI] });
   await client.start();
