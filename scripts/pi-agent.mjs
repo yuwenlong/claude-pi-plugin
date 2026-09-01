@@ -20,6 +20,7 @@ const USAGE = `用法：pi-agent <子命令> [选项] [--] <文本>
   spawn <名字> [初始任务]       拉起一个常驻 pi agent
   send  <名字> <消息>           给常驻 agent 发消息并等结果
   steer <名字> <消息>           在 agent 干活途中插话纠偏
+  abort <名字>                 打断 agent 当前这一轮
   list                         列出所有常驻 agent
   state <名字>                 查看某个 agent 的详细状态
   bash  <名字> <命令>           借 agent 的 shell 执行命令
@@ -34,6 +35,8 @@ const USAGE = `用法：pi-agent <子命令> [选项] [--] <文本>
   --timeout <毫秒>  等待上限（默认 180000）
   --no-wait         send 时只投递不等结果
   --full            ask 时加载 pi 扩展（默认不加载，省约 0.8s 冷启动）
+  --no-extensions   spawn 时不加载 pi 扩展。给纯实施型 agent 用：既省冷启动，
+                    也从源头避免扩展弹出未设超时的确认框把这一轮卡死
   --json            输出原始 JSON
   --stdin           位置参数改从标准输入读取（slash 命令用它绕开 shell 引号问题）`;
 
@@ -83,6 +86,7 @@ async function cmdAsk(options, positional) {
     session: false, // 一次性问答不落盘，免得污染 `pi -r` 的会话列表
     // 问一句话用不上扩展，省下大半冷启动时间；要完整能力就传 --full。
     extensions: options.full ? undefined : false,
+    dialogTimeoutMs: config.limits.extensionDialogTimeoutMs,
   });
 
   try {
@@ -113,6 +117,7 @@ async function cmdSpawn(options, positional) {
     model: options.model,
     thinkingLevel: options.thinking,
     initialPrompt: joinText(rest) || undefined,
+    extensions: options["no-extensions"] ? false : undefined,
   });
 
   if (options.json) return out(JSON.stringify(data, null, 2));
@@ -140,6 +145,13 @@ async function cmdSteer(options, positional) {
   if (!id || !message) fail("用法：pi-agent steer <名字> -- <消息>");
   await callDaemon("steer", { id, message });
   out(`✓ 已向 "${id}" 插话：${message}`);
+}
+
+async function cmdAbort(options, positional) {
+  const [id] = positional;
+  if (!id) fail("用法：pi-agent abort <名字>");
+  await callDaemon("abort", { id });
+  out(`✓ 已打断 "${id}" 当前这一轮`);
 }
 
 async function cmdList(options) {
@@ -222,6 +234,7 @@ const COMMANDS = {
   spawn: { handler: cmdSpawn, stdin: "id+text" },
   send: { handler: cmdSend, stdin: "id+text" },
   steer: { handler: cmdSteer, stdin: "id+text" },
+  abort: { handler: cmdAbort, stdin: "id" },
   bash: { handler: cmdBash, stdin: "id+text" },
   state: { handler: cmdState, stdin: "id" },
   stop: { handler: cmdStop, stdin: "id" },

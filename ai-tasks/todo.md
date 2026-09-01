@@ -103,3 +103,87 @@
 
 - 单测 40/40 通过（新增 3 条：握手缓存、`--no-extensions` 透传、默认不禁用扩展）
 - 三条路径端到端实跑正常：精简 `ask`、`--full` `ask`、`spawn` 常驻 agent
+
+---
+
+## 2026-09-01 追加：防常驻 agent 被扩展弹窗卡死 + abort 命令 + spawn --no-extensions
+
+圣上问"pi 弹确认框没人点会不会卡死"。查 `rpc-mode.js` 确认：扩展调的 `ui.confirm/select/input/editor`
+若自己不传 `timeout`，`extension_ui_request` 会一直等 `extension_ui_response`，而插件目前完全不应答，
+会永久挂起（`send`/`ask` 自带超时能保住臣的主会话，但被卡住的那个 pi agent 本身不会自愈）。
+圣上确认三项都做，这次臣直接改代码。完整计划见 `C:\Users\Administrator\.claude\plans\moonlit-splashing-pnueli.md`。
+
+### 任务清单
+
+- [x] `scripts/lib/rpc-client.mjs`：抽出 `#emit`，新增 `#armDialogFallback`/`respondToDialog`/`dialogTimeoutMs`，`stop()` 清理未触发定时器
+- [x] `scripts/lib/config.mjs`：`DEFAULTS.limits` 加 `extensionDialogTimeoutMs: 30_000`
+- [x] `scripts/lib/daemon.mjs`：`spawnAgent` 透传 `dialogTimeoutMs`/`extensions`，记录 `extension_dialog_autocancelled` 日志，新增 `abort` handler
+- [x] `scripts/pi-agent.mjs`：`cmdAsk` 透传 `dialogTimeoutMs`；新增 `cmdAbort`；`cmdSpawn` 支持 `--no-extensions`；`USAGE` 更新
+- [x] `scripts/lib/args.mjs`：`BOOL_FLAGS` 加 `no-extensions`
+- [x] `commands/abort.md` 新增；`commands/spawn.md` 补充说明（并纠正为：`--no-extensions` 打在 slash 参数文本里不生效，只能走 CLI 直调）
+- [x] `.claude-plugin/plugin.json`：`commands` 加 `abort.md`，`version` → 0.3.0
+- [x] `.claude-plugin/marketplace.json`：`metadata.version` → 0.3.0
+- [x] `package.json`：`version` → 0.3.0
+- [x] `tests/fixtures/fake-pi.mjs`：`trigger_dialog` + `extension_ui_response` 拦截 + `get_last_dialog_response` + `abort` 分支
+- [x] `tests/rpc-client.test.mjs`：兜底应答 + 自动取消事件 + stop 清理定时器，三个新用例
+- [x] `tests/args.test.mjs`：`--no-extensions` 用例
+- [x] `tests/config.test.mjs`：`extensionDialogTimeoutMs` 默认值用例
+- [x] `npm test` 全绿，抄真实输出到评审段落
+- [x] README：命令表加 `abort`、配置示例补字段、排错表补一条、新增"扩展弹窗会不会卡死常驻 agent"小节；顺手纠正了一处预先存在的错误示例（见评审）
+- [x] 真机验证：doctor / spawn（带与不带 --no-extensions）/ abort 空闲 agent
+- [x] git commit（中文提交信息，不 push）
+
+### 评审
+
+#### 交付结果
+
+三项都已落地：
+1. `PiRpcClient` 对扩展弹窗（`confirm`/`select`/`input`/`editor`）加了兜底超时（默认 30s，
+   `limits.extensionDialogTimeoutMs` 可配），到点自动回 `{cancelled:true}` 并广播
+   `extension_dialog_autocancelled` 事件，daemon 侧记日志。彻底堵住"扩展没设 timeout → 永久挂起"这条路。
+2. 新增 `/claude-pi:abort <名字>`，daemon 新增 `abort` handler，复用已有的 `PiRpcClient.abort()`。
+3. `spawn` 支持 `--no-extensions`（仅限直接 CLI 调用，非 slash 命令参数——见下方"意外发现"）。
+
+#### 验证证据
+
+1. **单测**：`npm test` → `node --test "tests/**/*.test.mjs"` → **43 tests / 43 pass / 0 fail**
+   （新增 5 条：兜底自动应答+事件、stop 清理定时器、`--no-extensions` 参数识别、
+   `extensionDialogTimeoutMs` 默认值，外加 fake-pi 里新增的 `trigger_dialog`/`abort` 协议桩）。
+   全套耗时 ~20.4s，与改动前的量级一致（真实子进程握手每条 ~1.3s 是既有开销，非本次引入）。
+2. **真机 doctor**：`node scripts/pi-agent.mjs doctor` → pi CLI 0.84.3、Node v26.8.1、守护进程正常起停。
+3. **真机 spawn（默认）**：`spawn -- verify1 "你是谁，只回一句话"` → 正常拿到回复，`kimi-coding/k3`。
+4. **真机 spawn --no-extensions**：`spawn --no-extensions -- verify2 "你是谁，只回一句话"` → 同样正常拿到回复；
+   两次回复内容明显不同（verify1 带上了圣上 CLAUDE.md 里的丞相人设，verify2 没有），侧面证实
+   `--no-extensions` 确实被透传并改变了 pi 的实际行为，不是只改了个没用的参数。
+5. **真机 abort**：对空闲的 `verify1` 调用 `abort` → `✓ 已打断 "verify1" 当前这一轮`，`list` 显示仍是
+   `idle`，无异常。已用 `stop --all` 清理掉这两个测试 agent。
+
+#### 覆盖边界（如实说明，不夸大）
+
+真实触发"扩展弹出未设超时确认框"这个场景没法在本机复现——需要一个专门这么写、且明知会
+永久挂起的扩展，本机装的扩展都不会故意留这种坑。这条路径的正确性完全靠单测（`tests/fixtures/fake-pi.mjs`
+精确模拟 `extension_ui_request` 协议行为）覆盖，不是靠真实 pi + 真实扩展的端到端验证。
+`abort` 命令对"卡在未应答扩展弹窗"这种场景是否真能救场也没法实测（`session.abort()` 会不会
+连带打断那个 pending 的 `ui.confirm()` 调用，取决于 pi 内部实现，臣没有源码级证据）——
+README 和 `commands/abort.md` 里都写清楚了："真正兜底的是插件自己的超时自动取消，`abort`
+主要用于主动打断跑偏的推理/工具调用"，没有替 `abort` 打不该打的包票。
+
+也没有走"卸载重装 `/plugin`"这条路真机验证 slash 命令层：当前 `claude-pi@claude-pi` 是从
+GitHub 装的 0.2.1，圣上日常在用；为了不影响圣上正在依赖的常驻 agent，臣选择直接跑
+`node scripts/pi-agent.mjs <cmd>`（slash 命令的 `!` 那行本质就是包了一层这条命令）来验证核心
+逻辑，没有动圣上已安装的插件注册。`.claude-plugin/plugin.json`/`marketplace.json` 的结构性改动
+（新增 `abort.md`、版本号）过了 `claude plugin validate .`，但 slash 命令模板本身（`commands/abort.md`
+等 `.md` 文件）没有在真实 Claude Code 会话里敲 `/claude-pi:abort` 端到端跑过一次。这一步等
+提交后圣上想升级到 0.3.0 时（push 到 GitHub 或本地路径重装）再补。
+
+#### 意外发现（顺手修的一处既有 bug）
+
+翻源码验证 `--no-extensions` 的传参路径时发现：README 原先写着"单次调用也可以临时覆盖，
+直接把选项写在命令里"，举的例子是 `/claude-pi:ask --provider anthropic --model claude-sonnet-4 问题`——
+但 slash 命令的 `$ARGUMENTS` 全部走 `--stdin` 当纯文本喂给 `pi-agent.mjs`（`args.mjs` 里
+`applyStdin` 的 `"text"`/`"id+text"` 形态都是整段原样返回，不会被 `parseArgs` 重新解析），
+所以这样打字，`--provider anthropic` 根本不会被识别成选项，而是会原样出现在发给 pi 的问题文本里。
+这个例子从一开始就是错的，不是本次改动引入的。已经在 README 里改成了 CLI 直调的写法，
+并说明了"为什么 `--` 开头的文本在 slash 命令里不会被当选项"（这本来就是 `args.mjs` 的设计初衷，
+注释里写得很清楚："用户随口写个 `--fix` 不该被误当选项"——原 README 例子恰恰示范了一个会被
+这条防御机制吞掉的用法）。

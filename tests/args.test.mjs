@@ -13,6 +13,11 @@ test("开关选项被识别为 true", () => {
   assert.equal(options.json, true);
 });
 
+test("--no-extensions 被识别为开关选项", () => {
+  const { options } = parseArgs(["--no-extensions"]);
+  assert.equal(options["no-extensions"], true);
+});
+
 test("`--` 之后的一切都是位置参数", () => {
   const { options, positional } = parseArgs(["--model", "k3", "--", "--all", "这是问题"]);
   assert.deepEqual(options, { model: "k3" });

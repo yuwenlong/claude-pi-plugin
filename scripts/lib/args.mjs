@@ -14,7 +14,7 @@ const VALUE_FLAGS = new Set([
   "name",
 ]);
 
-const BOOL_FLAGS = new Set(["all", "json", "no-wait", "help", "stdin", "full"]);
+const BOOL_FLAGS = new Set(["all", "json", "no-wait", "help", "stdin", "full", "no-extensions"]);
 
 export function parseArgs(argv) {
   const options = {};

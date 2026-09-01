@@ -105,3 +105,38 @@ test("重复 start 会被拒绝", async () => {
     await assert.rejects(() => client.start(), /已启动/);
   });
 });
+
+test("扩展弹窗超时没人应答，客户端会兜底写回取消，并广播可观测事件", async () => {
+  await withClient({ dialogTimeoutMs: 20 }, async (client) => {
+    const events = [];
+    client.onEvent((e) => events.push(e));
+
+    await client.send({ type: "trigger_dialog" });
+    await new Promise((resolve) => setTimeout(resolve, 80));
+
+    const auto = events.find((e) => e.type === "extension_dialog_autocancelled");
+    assert.ok(auto, "应该广播 extension_dialog_autocancelled 事件");
+    assert.equal(auto.id, "dlg1");
+    assert.equal(auto.method, "confirm");
+
+    const written = await client.send({ type: "get_last_dialog_response" });
+    assert.equal(written.data.id, "dlg1");
+    assert.equal(written.data.cancelled, true);
+  });
+});
+
+test("stop() 会清掉还没触发的弹窗兜底计时器", async () => {
+  const client = new PiRpcClient({ cliPath: process.execPath, prefixArgs: [FAKE_PI], dialogTimeoutMs: 50 });
+  await client.start();
+  const events = [];
+  client.onEvent((e) => events.push(e));
+
+  await client.send({ type: "trigger_dialog" });
+  await client.stop();
+  await new Promise((resolve) => setTimeout(resolve, 100));
+
+  assert.ok(
+    !events.some((e) => e.type === "extension_dialog_autocancelled"),
+    "stop 后不该再触发兜底自动取消",
+  );
+});

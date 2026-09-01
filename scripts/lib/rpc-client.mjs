@@ -14,13 +14,21 @@ import { attachLineReader, serializeLine } from "./jsonl.mjs";
 const COMMAND_TIMEOUT_MS = 30_000;
 /** 启动握手上限：靠一次 get_state 探活，比固定 sleep 更可靠。 */
 const HANDSHAKE_TIMEOUT_MS = 30_000;
+/**
+ * 扩展弹窗（confirm/select/input/editor）兜底应答上限。我们是无人值守的 headless 客户端，
+ * 扩展若没给 `ui.confirm()` 等调用传自己的 timeout，pi 会一直挂着等 `extension_ui_response`——
+ * 到点没人答就自动回"取消"，避免这一轮永久挂起。
+ */
+const DEFAULT_DIALOG_TIMEOUT_MS = 30_000;
+/** pi 侧会挂起等响应的扩展 UI 方法；notify/setStatus/setWidget/setTitle 等是 fire-and-forget，不用管。 */
+const DIALOG_METHODS_NEEDING_RESPONSE = new Set(["confirm", "select", "input", "editor"]);
 
 export class PiRpcClient {
   /**
    * @param {{
    *   cliPath?: string, cwd?: string, env?: Record<string,string>,
    *   provider?: string, model?: string, session?: boolean, extensions?: boolean,
-   *   prefixArgs?: string[], extraArgs?: string[]
+   *   dialogTimeoutMs?: number, prefixArgs?: string[], extraArgs?: string[]
    * }} options
    *
    * prefixArgs 排在 `--mode rpc` 之前，测试用它把 cliPath 指向 node、再传入桩脚本路径。
@@ -36,6 +44,9 @@ export class PiRpcClient {
     this.exited = null; // { code, signal }
     /** start() 的握手顺带拿回的会话状态，省掉调用方再问一次。 */
     this.initialState = null;
+    /** 未应答的扩展弹窗兜底计时器：extension_ui_request.id -> Timeout */
+    this.pendingDialogs = new Map();
+    this.dialogTimeoutMs = options.dialogTimeoutMs ?? DEFAULT_DIALOG_TIMEOUT_MS;
   }
 
   // ---------------------------------------------------------------- 生命周期
@@ -113,6 +124,8 @@ export class PiRpcClient {
     });
 
     this.pending.clear();
+    for (const timer of this.pendingDialogs.values()) clearTimeout(timer);
+    this.pendingDialogs.clear();
   }
 
   // ---------------------------------------------------------------- 事件订阅
@@ -125,6 +138,21 @@ export class PiRpcClient {
 
   getStderr() {
     return this.stderr;
+  }
+
+  /**
+   * 主动应答一次扩展弹窗（`confirm`/`select`/`input`/`editor`）。
+   * 当前没有 UI 承载方，唯一调用方是内部的兜底超时；留成公开方法是给未来接入真实交互留口子。
+   */
+  respondToDialog(id, response) {
+    const stdin = this.process?.stdin;
+    if (!stdin) return;
+    const timer = this.pendingDialogs.get(id);
+    if (timer) {
+      clearTimeout(timer);
+      this.pendingDialogs.delete(id);
+    }
+    stdin.write(serializeLine({ type: "extension_ui_response", id, ...response }));
   }
 
   // ---------------------------------------------------------------- 命令封装
@@ -235,6 +263,15 @@ export class PiRpcClient {
       return;
     }
 
+    if (payload?.type === "extension_ui_request") {
+      this.#armDialogFallback(payload);
+    }
+
+    this.#emit(payload);
+  }
+
+  /** 分发给所有订阅者；供真实协议行、以及下面的兜底超时合成事件共用。 */
+  #emit(payload) {
     for (const listener of [...this.listeners]) {
       try {
         listener(payload);
@@ -242,6 +279,25 @@ export class PiRpcClient {
         // 监听器自身出错不该拖垮读取循环
       }
     }
+  }
+
+  /**
+   * 对需要应答的扩展弹窗起一个兜底计时器：`dialogTimeoutMs` 内没人主动 `respondToDialog`，
+   * 就自动回"取消"，防止扩展没传自己的 timeout 时把这一轮永久挂起。
+   */
+  #armDialogFallback(request) {
+    if (!DIALOG_METHODS_NEEDING_RESPONSE.has(request.method)) return;
+    const timer = setTimeout(() => {
+      this.respondToDialog(request.id, { cancelled: true });
+      this.#emit({
+        type: "extension_dialog_autocancelled",
+        id: request.id,
+        method: request.method,
+        title: request.title,
+      });
+    }, this.dialogTimeoutMs);
+    timer.unref?.();
+    this.pendingDialogs.set(request.id, timer);
   }
 
   /** 进程挂掉时，把所有在途请求一次性打回。 */

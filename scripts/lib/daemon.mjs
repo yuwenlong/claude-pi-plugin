@@ -53,7 +53,7 @@ function requireAgent(id) {
   return agent;
 }
 
-async function spawnAgent({ id, cwd, provider, model, thinkingLevel, initialPrompt }) {
+async function spawnAgent({ id, cwd, provider, model, thinkingLevel, initialPrompt, extensions }) {
   if (agents.has(id)) throw new Error(`agent "${id}" 已存在`);
   if (agents.size >= config.limits.maxConcurrentAgents) {
     throw new Error(`并发 agent 数已达上限（${config.limits.maxConcurrentAgents}）`);
@@ -66,6 +66,8 @@ async function spawnAgent({ id, cwd, provider, model, thinkingLevel, initialProm
     model: resolved.model,
     env: resolveAuthEnv(resolved.provider, config),
     session: true,
+    extensions: extensions === false ? false : undefined,
+    dialogTimeoutMs: config.limits.extensionDialogTimeoutMs,
   });
 
   await client.start();
@@ -96,6 +98,9 @@ async function spawnAgent({ id, cwd, provider, model, thinkingLevel, initialProm
     if (event?.type === "agent_end") {
       info.status = "idle";
       info.turns += 1;
+    }
+    if (event?.type === "extension_dialog_autocancelled") {
+      log(`agent ${id} 有个扩展弹窗（${event.method}${event.title ? `：${event.title}` : ""}）没人应答，已兜底自动取消`);
     }
     info.lastActivityAt = new Date().toISOString();
   });
@@ -145,6 +150,11 @@ const handlers = {
   async steer({ id, message }) {
     await requireAgent(id).client.steer(message);
     return { id, steered: true };
+  },
+
+  async abort({ id }) {
+    await requireAgent(id).client.abort();
+    return { id, aborted: true };
   },
 
   async state({ id }) {

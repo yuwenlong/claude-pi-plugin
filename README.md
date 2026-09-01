@@ -63,6 +63,7 @@ Claude Code 擅长统筹，Pi 是另一个快而能干的编程智能体。这�
 | `/claude-pi:spawn <名字> [初始任务]` | 拉起一个常驻 agent |
 | `/claude-pi:send <名字> <消息>` | 给常驻 agent 发消息并等结果 |
 | `/claude-pi:steer <名字> <指令>` | 在它干活途中插话纠偏 |
+| `/claude-pi:abort <名字>` | 打断某个 agent 当前这一轮 |
 | `/claude-pi:list` | 列出所有常驻 agent 及状态 |
 | `/claude-pi:bash <名字> <命令>` | 借它的 shell 执行命令 |
 | `/claude-pi:stop <名字>` | 停掉某个 agent（`--all` 全停） |
@@ -114,16 +115,25 @@ Claude Code 擅长统筹，Pi 是另一个快而能干的编程智能体。这�
   "limits": {
     "maxConcurrentAgents": 5,
     "defaultTimeoutMs": 180000,
-    "daemonIdleTimeoutMs": 1800000
+    "daemonIdleTimeoutMs": 1800000,
+    "extensionDialogTimeoutMs": 30000
   }
 }
 ```
 
-单次调用也可以临时覆盖，直接把选项写在命令里：
+`extensionDialogTimeoutMs` 见下方"扩展弹窗会不会卡死常驻 agent"一节。
 
+单次调用也可以临时覆盖，但**只在直接跑 CLI 时**生效（见下方"开发"一节），
+不是把选项打在 slash 命令的问题文本里：
+
+```bash
+node scripts/pi-agent.mjs ask --provider anthropic --model claude-sonnet-4 -- "这段代码有什么问题？"
 ```
-/claude-pi:ask --provider anthropic --model claude-sonnet-4 这段代码有什么问题？
-```
+
+因为 slash 命令的 `$ARGUMENTS` 一律经 `--stdin` 当作纯文本喂给 pi-agent（见"已知边界"），
+`/claude-pi:ask --provider anthropic 这段代码有什么问题？` 这样打字，`--provider anthropic`
+不会被识别成选项，而是会原样出现在发给 pi 的问题里——这是故意的：不然用户话里随口带的
+`--` 就可能被误当成选项吞掉。
 
 ---
 
@@ -159,10 +169,25 @@ Claude Code 擅长统筹，Pi 是另一个快而能干的编程智能体。这�
 |------|------|
 | 提示找不到 pi CLI | `npm install -g @earendil-works/pi-coding-agent` |
 | 命令卡住不返回 | 加大 `--timeout`，或 `/claude-pi:list` 看 agent 是不是还在忙 |
+| 常驻 agent 一直显示 `busy` 不动 | 先 `/claude-pi:abort <名字>` 打断当前这一轮；若还是不动，看下面"扩展弹窗会不会卡死常驻 agent" |
 | 守护进程连不上 | 看日志 `~/.claude-pi-plugin/daemon.log` |
 | 想彻底重置 | `/claude-pi:stop --all`，必要时删掉 `~/.claude-pi-plugin/daemon.sock` |
 
 **已知边界**：斜杠命令的参数经由 shell 传递，插件用 quoted heredoc 兜住了引号、`$`、换行等特殊字符；但如果提问里带**反引号**，会提前终止命令的反引号包裹。这种情况请改用 `/claude-pi:send` 分多次说，或把代码放进文件再让 agent 去读。
+
+### 扩展弹窗会不会卡死常驻 agent
+
+pi 的内置工具（read/bash/edit/write）在 `--mode rpc` 下不会弹确认框，正常干活不受影响。
+唯一的风险来自 pi **扩展**：扩展可以调用 `ui.confirm/select/input/editor` 弹一个交互对话框，
+如果扩展自己没给这次调用传 `timeout`，pi 会一直等回应——而这里没有人在盯着屏幕点确认。
+
+插件对此有兜底：客户端收到这类弹窗请求后起一个计时器（默认 30 秒，`limits.extensionDialogTimeoutMs`
+可调），到点没人应答就自动回"取消"，让那一轮收场，而不是永久挂起。`/claude-pi:send`/`ask`
+本身也自带超时（默认 180 秒），所以即便真遇上这种情况，Claude 的主会话也不会被拖死；
+真正会"卡住"的只是那个 pi agent 本身，会一直显示 `busy` 直到兜底超时触发或你手动 `abort`。
+
+不想承担这份风险的话，`spawn` 一个纯实施型 agent 时可以直接不加载扩展（见"开发"一节里的
+CLI 用法，`--no-extensions` 打在 slash 命令的参数文本里不生效）——从源头避免这类弹窗。
 
 ---
 
@@ -172,6 +197,7 @@ Claude Code 擅长统筹，Pi 是另一个快而能干的编程智能体。这�
 npm test                        # node:test，零依赖，不需要真的 pi
 node scripts/pi-agent.mjs doctor
 node scripts/pi-agent.mjs ask -- "你是什么大模型？"
+node scripts/pi-agent.mjs spawn --no-extensions -- worker "重构 auth 模块"
 ```
 
 测试用 `tests/fixtures/fake-pi.mjs` 这个协议桩替代真实 pi，所以离线也能跑全。

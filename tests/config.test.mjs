@@ -22,6 +22,7 @@ test("没有配置文件时退回内置默认值", () => {
   const config = loadConfig(join(tmpdir(), "claude-pi-does-not-exist.json"));
   assert.equal(config.limits.maxConcurrentAgents, 5);
   assert.equal(config.defaults.provider, undefined);
+  assert.equal(config.limits.extensionDialogTimeoutMs, 30_000);
 });
 
 test("配置写坏了也不让插件崩，退回默认值", () => {

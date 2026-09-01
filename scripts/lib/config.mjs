@@ -23,6 +23,8 @@ const DEFAULTS = {
     maxConcurrentAgents: 5,
     defaultTimeoutMs: 180_000,
     daemonIdleTimeoutMs: 30 * 60_000,
+    // 扩展弹窗（confirm/select/input/editor）没人应答时的兜底自动取消时限。
+    extensionDialogTimeoutMs: 30_000,
   },
 };
 
