@@ -66,3 +66,25 @@ Windows Terminal 承载），且 agent 活多久它就杵多久。修法是给�
   照样起 conhost）。真正的判据是枚举顶层窗口 + `IsWindowVisible`，再把窗口 pid 反查到父进程。
 - 圣上给的归因（"是不是 pi 升级导致的"）是**线索不是结论**。本例中插件只有一个提交、从未改过，
   而黑窗随 agent 起停同生同灭——先做能证伪的实验，再下判断。
+
+## 2026-09-01 · slash 命令的 `$ARGUMENTS` 打不进任何 `--flag`，这是设计使然
+
+**事情经过**：给 `spawn` 加 `--no-extensions` 时，下意识照着 README 里"单次调用也可以临时覆盖，
+直接把选项写在命令里"那个例子（`/claude-pi:ask --provider anthropic ... 问题`）去写用法说明，
+差点把同样错误的写法也套到新 flag 上。追了一遍 `commands/*.md` → `applyStdin` → `parseArgs` 的
+完整链路才发现：所有 slash 命令的 `$ARGUMENTS` 都经 `--stdin` 走 `applyStdin`（"text"/"id+text"
+形态），整段原样塞进 positional，从来不会被 `parseArgs` 重新解析——这是 `args.mjs` 自己的设计
+初衷（防止用户话里带的 `--` 被误当选项），不是 bug，但 README 那个例子确实示范了一个不生效的
+用法，从项目一开始就是错的，只是没人拿它实测过。
+
+**给自己立的规矩**：
+
+- 这个插件里，`VALUE_FLAGS`/`BOOL_FLAGS`（`args.mjs`）能用的场合只有**直接 CLI 调用**
+  （`node scripts/pi-agent.mjs <cmd> --flag ... -- <文本>`），**不能**指望用户在 Claude Code 里
+  打 `/claude-pi:xxx --flag ...` 生效。新增任何选项，文档里必须写清楚"这是 CLI 用法，不是
+  slash 命令参数"，否则就是在示范一个会静默失败（选项文字混进消息正文）的用法。
+- 想让某个选项真的能在 slash 命令里用，唯一的路是改 `commands/*.md` 的 `!` 那行，在 shell 层
+  自己解析出 flag 再拼进 node 的真实 argv——这条路目前没人走过，如果以后要做，得先在这个
+  仓库里验一次 Windows 下 `!` 命令的实际执行 shell 是什么、跨平台是否一致，不能想当然。
+- 改别人（哪怕是自己）写的文档例子之前，**先按着代码路径走一遍再信**，不要因为它"看起来
+  应该能行"就直接复制粘贴当范本。
