@@ -46,6 +46,8 @@ export class PiRpcClient {
     this.initialState = null;
     /** 未应答的扩展弹窗兜底计时器：extension_ui_request.id -> Timeout */
     this.pendingDialogs = new Map();
+    /** 正在等 agent_end 的人。他们不在 pending 里，进程死掉时得由 #fail 单独叫醒。 */
+    this.idleWaiters = new Set();
     this.dialogTimeoutMs = options.dialogTimeoutMs ?? DEFAULT_DIALOG_TIMEOUT_MS;
   }
 
@@ -177,8 +179,9 @@ export class PiRpcClient {
     await this.send({ type: "set_thinking_level", level });
   }
 
-  async bash(command) {
-    return this.#data(await this.send({ type: "bash", command }));
+  /** 跑一条 shell 命令。编译、测试动辄几分钟，所以超时由调用方给，不套用命令级的 30s。 */
+  async bash(command, timeoutMs) {
+    return this.#data(await this.send({ type: "bash", command }, timeoutMs));
   }
 
   async getLastAssistantText() {
@@ -193,16 +196,25 @@ export class PiRpcClient {
   /** 等待本轮跑完（agent_end）。pi 之后还会发 agent_settled，不必等它。 */
   waitForIdle(timeoutMs = 180_000) {
     return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
-        off();
-        reject(new Error(`等待 pi 完成超时（${timeoutMs}ms）${this.#stderrTail()}`));
-      }, timeoutMs);
-
-      const off = this.onEvent((event) => {
-        if (event.type !== "agent_end") return;
+      const settle = (fn, arg) => {
         clearTimeout(timer);
         off();
-        resolve();
+        this.idleWaiters.delete(waiter);
+        fn(arg);
+      };
+
+      const timer = setTimeout(
+        () => settle(reject, new Error(`等待 pi 完成超时（${timeoutMs}ms）${this.#stderrTail()}`)),
+        timeoutMs,
+      );
+
+      // 登记进来：pi 半路死了，agent_end 永远不会来，得由 #fail 立刻打回，
+      // 而不是让调用方干等满整个超时、还拿到一句掩盖真实死因的「超时」。
+      const waiter = { reject: (err) => settle(reject, err) };
+      this.idleWaiters.add(waiter);
+
+      const off = this.onEvent((event) => {
+        if (event.type === "agent_end") settle(resolve);
       });
     });
   }
@@ -300,10 +312,12 @@ export class PiRpcClient {
     this.pendingDialogs.set(request.id, timer);
   }
 
-  /** 进程挂掉时，把所有在途请求一次性打回。 */
+  /** 进程挂掉时，把所有在途请求和等待者一次性打回。 */
   #fail(error) {
     for (const waiter of this.pending.values()) waiter.reject(error);
     this.pending.clear();
+    for (const waiter of [...this.idleWaiters]) waiter.reject(error);
+    this.idleWaiters.clear();
   }
 
   #data(response) {

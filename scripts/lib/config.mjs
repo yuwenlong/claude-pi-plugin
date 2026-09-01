@@ -70,6 +70,18 @@ export function providerEnvVar(provider) {
   return ENV_VAR_BY_PROVIDER[provider] ?? `${provider.toUpperCase().replace(/-/g, "_")}_API_KEY`;
 }
 
+/**
+ * baseUrl 变量名的前缀。
+ *
+ * 自定义的 apiKeyEnvVar 未必以 `_API_KEY` 收尾（huggingface 用的就是 `HF_TOKEN`），
+ * 那种情况改按 provider 名推，免得推出 `HF_TOKEN_BASE_URL` 这种谁也不认的名字。
+ */
+function baseUrlPrefix(provider, apiKeyEnvVar) {
+  return apiKeyEnvVar.endsWith("_API_KEY")
+    ? apiKeyEnvVar.slice(0, -"_API_KEY".length)
+    : provider.toUpperCase().replace(/-/g, "_");
+}
+
 /** 把配置里写死的 key / baseUrl 翻译成给 pi 子进程的环境变量。 */
 export function resolveAuthEnv(provider, config) {
   const env = {};
@@ -79,7 +91,7 @@ export function resolveAuthEnv(provider, config) {
 
   const name = entry.apiKeyEnvVar ?? providerEnvVar(provider);
   if (entry.apiKey) env[name] = entry.apiKey;
-  if (entry.baseUrl) env[`${name.replace(/_API_KEY$/, "")}_BASE_URL`] = entry.baseUrl;
+  if (entry.baseUrl) env[`${baseUrlPrefix(provider, name)}_BASE_URL`] = entry.baseUrl;
   return env;
 }
 

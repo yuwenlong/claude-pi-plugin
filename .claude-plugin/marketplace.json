@@ -6,13 +6,13 @@
   },
   "metadata": {
     "description": "用斜杠命令在 Claude Code 里驱动 Pi 编程智能体",
-    "version": "0.3.0"
+    "version": "0.4.0"
   },
   "plugins": [
     {
       "name": "claude-pi",
       "source": "./",
-      "description": "在 Claude Code 里用斜杠命令直接驱动 Pi 编程智能体：/pi 一次性提问，/pi-spawn 拉起常驻 agent 并行干活，/pi-steer 中途插话纠偏。纯 Node 内置模块实现，无需 npm install。",
+      "description": "在 Claude Code 里用斜杠命令直接驱动 Pi 编程智能体：/claude-pi:ask 一次性提问，/claude-pi:spawn 拉起常驻 agent 并行干活，/claude-pi:steer 中途插话纠偏。纯 Node 内置模块实现，无需 npm install。",
       "category": "productivity",
       "tags": ["pi", "agent", "orchestration", "coding-agent", "parallel"]
     }

@@ -65,7 +65,7 @@ Claude Code 擅长统筹，Pi 是另一个快而能干的编程智能体。这�
 | `/claude-pi:steer <名字> <指令>` | 在它干活途中插话纠偏 |
 | `/claude-pi:abort <名字>` | 打断某个 agent 当前这一轮 |
 | `/claude-pi:list` | 列出所有常驻 agent 及状态 |
-| `/claude-pi:bash <名字> <命令>` | 借它的 shell 执行命令 |
+| `/claude-pi:bash <名字> <命令>` | 借它的 shell 执行命令（等待上限同 `limits.defaultTimeoutMs`，默认 180 秒） |
 | `/claude-pi:stop <名字>` | 停掉某个 agent（`--all` 全停） |
 | `/claude-pi:doctor` | 环境自检 |
 
@@ -81,8 +81,9 @@ Claude Code 擅长统筹，Pi 是另一个快而能干的编程智能体。这�
 
 所以觉得慢时，先怀疑 provider 而不是插件。几条实测有效的提速手段：
 
-- `ask` 默认已禁用 pi 扩展（省约 1.4s 冷启动）。要用扩展就加 `--full`。
-- 简单问答可以压低思考级别：`/claude-pi:ask --thinking low 你的问题`。pi 默认可能是 `high`，问一句话用不上。
+- `ask` 默认已禁用 pi 扩展（省约 1.4s 冷启动）。要用扩展就加 `--full`（CLI 直调时）。
+- 简单问答可以压低思考级别，pi 默认可能是 `high`，问一句话用不上——但**这类选项只在 CLI 直调时生效**：
+  `node scripts/pi-agent.mjs ask --thinking low -- "你的问题"`。写在 slash 命令里不管用，原因见下方「已知边界」。
 - 要连问多轮，用 `spawn` 起常驻 agent，之后每次 `send` 都省掉整个冷启动。
 
 ### `ask` 与 `spawn` 怎么选
@@ -90,6 +91,9 @@ Claude Code 擅长统筹，Pi 是另一个快而能干的编程智能体。这�
 `ask` 每次都新起一个 pi 进程，问完即销毁，不留会话文件——适合单点提问、换个模型问个第二意见。
 
 `spawn` 起的 agent 常驻在后台，**记得上文**，适合交给它一件需要多轮推进的活。用完记得 `stop`。
+
+同一个 agent 的多次 `send` 会**排队**：前一轮落地，下一轮才开口，各自拿各自的答案。
+所以连着给同一个 agent 派活是安全的，不会拿回上一轮的结果。
 
 ---
 
@@ -122,6 +126,11 @@ Claude Code 擅长统筹，Pi 是另一个快而能干的编程智能体。这�
 ```
 
 `extensionDialogTimeoutMs` 见下方"扩展弹窗会不会卡死常驻 agent"一节。
+`defaultTimeoutMs` 同时也是 `/claude-pi:bash` 的等待上限——编译、跑测试都归它管。
+
+改完配置得让守护进程重新读：它在启动时快照一次 `config.json`，之后不再重读。
+`stop --all` 只收 agent、不关守护进程，等它闲置退场（默认 30 分钟）即可，
+急的话结束 `~/.claude-pi-plugin/daemon.pid` 里记的那个进程。
 
 单次调用也可以临时覆盖，但**只在直接跑 CLI 时**生效（见下方"开发"一节），
 不是把选项打在 slash 命令的问题文本里：
@@ -168,7 +177,7 @@ node scripts/pi-agent.mjs ask --provider anthropic --model claude-sonnet-4 -- "�
 | 症状 | 处理 |
 |------|------|
 | 提示找不到 pi CLI | `npm install -g @earendil-works/pi-coding-agent` |
-| 命令卡住不返回 | 加大 `--timeout`，或 `/claude-pi:list` 看 agent 是不是还在忙 |
+| 命令卡住不返回 | 先 `/claude-pi:list` 看 agent 是不是还在忙；要加大等待上限得走 CLI 直调的 `--timeout` |
 | 常驻 agent 一直显示 `busy` 不动 | 先 `/claude-pi:abort <名字>` 打断当前这一轮；若还是不动，看下面"扩展弹窗会不会卡死常驻 agent" |
 | 守护进程连不上 | 看日志 `~/.claude-pi-plugin/daemon.log` |
 | 想彻底重置 | `/claude-pi:stop --all`，必要时删掉 `~/.claude-pi-plugin/daemon.sock` |

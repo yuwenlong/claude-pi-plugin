@@ -79,6 +79,17 @@ test("响应按 id 精确回到各自的等待者，不会串号", async () => {
   });
 });
 
+test("bash 的超时由调用方给，不再被命令级的 30 秒卡死", async () => {
+  await withClient({}, async (client) => {
+    // 给得太紧会超时……
+    await assert.rejects(() => client.bash("sleep:300", 50), /等待 bash 响应超时/);
+    // ……给够就能等到结果。编译、跑测试都属于后者。
+    const result = await client.bash("sleep:300", 5000);
+    assert.equal(result.exitCode, 0);
+    assert.equal(result.output, "ran: sleep:300");
+  });
+});
+
 test("success:false 的响应被翻译成异常", async () => {
   await withClient({}, async (client) => {
     await assert.rejects(() => client.send({ type: "explode" }).then((r) => {
@@ -91,6 +102,21 @@ test("waitForIdle 超时会报错并带上时长", async () => {
   await withClient({}, async (client) => {
     await assert.rejects(() => client.waitForIdle(50), /等待 pi 完成超时（50ms）/);
   });
+});
+
+test("pi 进程半路死掉时，等 agent_end 的人立刻被打回，不必干等满超时", async () => {
+  const client = new PiRpcClient({ cliPath: process.execPath, prefixArgs: [FAKE_PI] });
+  await client.start();
+
+  const startedAt = Date.now();
+  const idle = client.waitForIdle(30_000); // 故意给一个很宽的超时
+  client.send({ type: "crash" }).catch(() => {});
+
+  // 死因要如实报出来，而不是含糊地说一句「超时」把真正的原因盖掉。
+  await assert.rejects(() => idle, /pi 进程已退出/);
+  assert.ok(Date.now() - startedAt < 5000, "该立刻失败，而不是等满 30 秒");
+
+  await client.stop();
 });
 
 test("停止后再发命令会明确报错，而不是静默挂起", async () => {

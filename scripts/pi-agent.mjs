@@ -11,7 +11,7 @@ import { pathToFileURL } from "node:url";
 import { PiRpcClient } from "./lib/rpc-client.mjs";
 import { loadConfig, resolveAuthEnv, resolveAgentOptions, CONFIG_PATH } from "./lib/config.mjs";
 import { request, LOG_PATH } from "./lib/ipc.mjs";
-import { parseArgs, joinText, parseTimeout, applyStdin } from "./lib/args.mjs";
+import { parseArgs, joinText, parseTimeout, applyStdin, isStopAll } from "./lib/args.mjs";
 
 const USAGE = `用法：pi-agent <子命令> [选项] [--] <文本>
 
@@ -122,6 +122,10 @@ async function cmdSpawn(options, positional) {
 
   if (options.json) return out(JSON.stringify(data, null, 2));
   out(`✓ agent "${id}" 已就绪（${data.info.provider}/${data.info.model}，目录 ${data.info.cwd}）`);
+  if (data.initialError) {
+    out(`⚠ 首轮任务没跑完：${data.initialError}`);
+    out(`  agent 还在，可直接 /claude-pi:send ${id} <消息> 重新派活，不必换名字重开。`);
+  }
   if (data.reply) out(`\n【${id} 的回复】\n${data.reply}`);
 }
 
@@ -188,15 +192,18 @@ async function cmdBash(options, positional) {
   const command = joinText(rest);
   if (!id || !command) fail("用法：pi-agent bash <名字> -- <命令>");
 
-  const { result } = await callDaemon("bash", { id, command });
+  // 编译、跑测试动辄几分钟，超时得跟 send 一个量级，不能是命令级的 30 秒。
+  const timeoutMs = parseTimeout(options.timeout, loadConfig().limits.defaultTimeoutMs);
+  const { result } = await callDaemon("bash", { id, command, timeoutMs }, timeoutMs);
   if (options.json) return out(JSON.stringify(result, null, 2));
   out(`$ ${command}\n退出码: ${result.exitCode}${result.truncated ? "（输出已截断）" : ""}\n${result.output}`);
 }
 
 async function cmdStop(options, positional) {
   const [id] = positional;
-  if (!options.all && !id) fail("用法：pi-agent stop <名字>，或 pi-agent stop --all");
-  const { stopped } = await callDaemon("stop", { id, all: Boolean(options.all) });
+  const all = isStopAll(options, positional);
+  if (!all && !id) fail("用法：pi-agent stop <名字>，或 pi-agent stop --all");
+  const { stopped } = await callDaemon("stop", { id, all });
   out(stopped.length ? `✓ 已停止：${stopped.join(", ")}` : "没有需要停止的 agent。");
 }
 

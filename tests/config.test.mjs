@@ -60,6 +60,18 @@ test("resolveAuthEnv 把配置里的 key 与 baseUrl 翻译成环境变量", () 
   });
 });
 
+test("apiKeyEnvVar 不以 _API_KEY 收尾时，baseUrl 按 provider 名推", () => {
+  const config = mergeConfig({
+    providers: { huggingface: { apiKeyEnvVar: "HF_TOKEN", apiKey: "hf-x", baseUrl: "https://hf.test" } },
+    defaults: {},
+    limits: {},
+  });
+  assert.deepEqual(resolveAuthEnv("huggingface", config), {
+    HF_TOKEN: "hf-x",
+    HUGGINGFACE_BASE_URL: "https://hf.test",
+  });
+});
+
 test("未配置的 provider 不注入任何环境变量，交给 pi 自己的凭据", () => {
   const config = mergeConfig({ providers: {}, defaults: {}, limits: {} });
   assert.deepEqual(resolveAuthEnv("kimi-coding", config), {});

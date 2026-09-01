@@ -70,9 +70,15 @@ process.stdin.on("data", (chunk) => {
       case "get_last_assistant_text":
         respond(cmd.id, "get_last_assistant_text", { text: lastText });
         break;
-      case "bash":
-        respond(cmd.id, "bash", { output: `ran: ${cmd.command}`, exitCode: 0, cancelled: false, truncated: false });
+      // `sleep:<毫秒>` 用来模拟跑得久的命令（编译、测试），其余命令立刻回。
+      case "bash": {
+        const reply = () =>
+          respond(cmd.id, "bash", { output: `ran: ${cmd.command}`, exitCode: 0, cancelled: false, truncated: false });
+        const slow = /^sleep:(\d+)$/.exec(cmd.command);
+        if (slow) setTimeout(reply, Number(slow[1]));
+        else reply();
         break;
+      }
       case "abort":
         respond(cmd.id, "abort");
         break;
@@ -84,6 +90,10 @@ process.stdin.on("data", (chunk) => {
         break;
       case "get_last_dialog_response":
         respond(cmd.id, "get_last_dialog_response", lastDialogResponse);
+        break;
+      // 模拟 pi 跑一半整个进程没了：agent_end 永远不会来。
+      case "crash":
+        process.exit(9);
         break;
       case "explode":
         write({ id: cmd.id, type: "response", command: "explode", success: false, error: "故意失败" });

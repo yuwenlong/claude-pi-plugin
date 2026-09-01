@@ -82,6 +82,17 @@ export function applyStdin(shape, raw, positional) {
   return rest.trim() ? [...positional, id, rest.trim()] : [...positional, id];
 }
 
+/**
+ * 判定这次 stop 是不是「全停」。
+ *
+ * `--all` 在直接 CLI 调用时会被 parseArgs 收进 options；但 slash 命令的参数一律经
+ * `--stdin` 当纯文本进来（见 applyStdin），`--all` 会原样落在位置参数里，
+ * parseArgs 根本看不到它——所以两处都要认，否则 `/claude-pi:stop --all` 永远失效。
+ */
+export function isStopAll(options, positional) {
+  return Boolean(options.all) || positional[0] === "--all" || positional[0] === "all";
+}
+
 export function parseTimeout(value, fallback) {
   if (value === undefined) return fallback;
   const ms = Number.parseInt(value, 10);

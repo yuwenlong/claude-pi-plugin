@@ -187,3 +187,68 @@ GitHub 装的 0.2.1，圣上日常在用；为了不影响圣上正在依赖的�
 并说明了"为什么 `--` 开头的文本在 slash 命令里不会被当选项"（这本来就是 `args.mjs` 的设计初衷，
 注释里写得很清楚："用户随口写个 `--fix` 不该被误当选项"——原 README 例子恰恰示范了一个会被
 这条防御机制吞掉的用法）。
+
+---
+
+## 2026-09-01 追加：全量 review 后的缺陷修复（三批）
+
+圣上令「全修，可以分批修」。缺陷清单来自本次 review，每条都有实证（探针脚本复现，非推理）。
+实施交给常驻 pi agent `fixer`，臣负责定方案与逐条验收。
+
+### 第一批：用户可见的功能缺陷
+
+- [x] 缺陷1 `/claude-pi:stop --all` 从未生效：`--all` 经 `--stdin` 被当成 agent 名字，`options.all` 永远 undefined
+- [x] 缺陷2 `/claude-pi:bash` 30 秒硬超时：走 `send()` 的 `COMMAND_TIMEOUT_MS`，`cmdBash` 也不读 `--timeout`
+- [x] 缺陷3 agent 忙时 `send` 拿回上一轮答案：`waitForIdle` 只认「下一个 agent_end」，不区分轮次
+- [x] 三条各补单测，`npm test` 全绿
+
+### 第二批：健壮性
+
+- [x] 缺陷4 pi 进程崩溃时 `waitForIdle` 不被唤醒，要干等满超时；错误信息还掩盖真实死因
+- [x] 缺陷5 spawn 首轮任务失败时 agent 已入注册表，CLI 却报 `✗`，用户以为没起来
+- [x] 缺陷6 unix 平台两个 daemon 会互相踢掉 socket（Windows 走 named pipe 天然互斥）
+- [x] 补 `daemon.mjs` / `ipc.mjs` 的测试（这两个文件此前零覆盖，上述缺陷全藏在这里）
+
+### 第三批：文档与代码卫生
+
+- [x] 缺陷7 `README.md:85` 仍示范不生效的 `/claude-pi:ask --thinking low`；`:171` 同类；`marketplace.json` 描述停留在改名前的 `/pi`、`/pi-spawn`、`/pi-steer`
+- [x] 缺陷8 `daemon.mjs:189` 原型链穿透；`:207` 分帧丢残余；`config.mjs:82` baseUrl 推导；config 快照与日志轮转的说明
+
+### 验收标准
+
+每批完工后臣亲自跑：`npm test` + 针对性探针复现（改前失败、改后通过），不采信 pi 的自述。
+
+### 评审
+
+#### 交付结果
+
+八条缺陷全部落地，版本 0.3.0 → 0.4.0。新增 `scripts/lib/serial-queue.mjs`（每个 agent 一条串行队列）
+与 `tests/daemon.test.mjs`（daemon 此前零覆盖）。`daemon.mjs` 加了 `invokedDirectly` 守卫与
+`setClientFactory` 注入口，测试才得以用协议桩驱动真实的 handler 逻辑，而不是绕开它另测一套。
+
+#### 验证证据
+
+1. **单测**：`npm test` → **67 tests / 67 pass / 0 fail**（改前 43），耗时 ~21.9s。
+2. **反向验证**（关键，绿色本身不算证据）：逐条撤掉修复再跑，确认测试真能抓住缺陷——
+   撤串行队列 → 2 条红；撤 spawn 首轮容错 → 1 条红；撤「进程死了叫醒等待者」→ 那条等满 31.2 秒
+   后报 `等待 pi 完成超时（30000ms）`，正是缺陷原本的症状。还原后全绿（同一条 1.34 秒通过）。
+3. **缺陷1 端到端**：起 w1/w2 两个真 agent → `"--all" | pi-agent stop --stdin` → `✓ 已停止：w1, w2`；
+   改前同一条命令是 `✗ 没有名为 "--all" 的 agent`。
+4. **缺陷2 端到端**：`bash --timeout 100` 在 0.93 秒返回超时（改前写死 30 秒），证明 `--timeout`
+   确实穿过 CLI → daemon → rpc-client。
+5. **缺陷3 端到端**：`send --no-wait` 投第一轮后紧接着 `send` 第二轮 → 拿回 `SECOND-DONE`、耗时 9.1 秒
+   （覆盖两轮）；改前会在第一轮结束时就返回 `FIRST-DONE`。
+6. **缺陷6 端到端**：守护进程在岗时再启一个 → 退出码 0，日志记「已有守护进程在跑，本进程让位退出」，
+   原进程 PID 文件与服务均毫发无损。
+7. **完整链路回归**：doctor / spawn（带初始任务）/ send（上下文延续，准确复述上一轮）/ list（轮次 2）/
+   state / stop --all 全部正常。`claude plugin validate .` 通过。
+
+#### 没能验到的地方（如实说明）
+
+- **缺陷2 的真实长命令**没跑成：本机 Git Bash 已损坏（`add_item ("\??\D:\Git", "/", ...) failed`），
+  pi 的 bash 工具走的正是它，任何命令都返回 `3221225477`（访问违规）。所以「一条 35 秒的命令能跑完」
+  只有协议桩单测覆盖，没有真实 shell 的端到端证据。
+- **缺陷6 的 unix 侧**没法在本机验：Windows 走具名管道，`removeStaleSocketFile` 提前返回。
+  「两个 daemon 抢 socket 文件」这个原始故障场景只能靠代码推理，验到的是让位逻辑本身。
+- 同样因为 Git Bash 损坏，**slash 命令这一层整体没法实跑**（`commands/*.md` 里的 `!` 那行由 bash 执行）。
+  本次全部验证都走 `node scripts/pi-agent.mjs <cmd>`，也就是 slash 命令包着的那条命令本身。
